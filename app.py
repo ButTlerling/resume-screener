@@ -595,7 +595,8 @@ def main():
         st.subheader("Detailed Breakdown")
         for rank, r in enumerate(top_n, start=1):
             score = r.get("match_score", "N/A")
-            with st.expander(f"#{rank} — {r['filename']} — Score: {score}/10"):
+            name = r.get("candidate_name", "Unknown")
+            with st.expander(f"#{rank} — {name} — Score: {score}/10"):
                 st.write("**Summary:**", r.get("summary", ""))
                 st.write("**University:**", r.get("university", "Not listed"))
                 st.write("**Major:**", r.get("major", "Not listed"))
