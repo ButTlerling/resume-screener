@@ -431,7 +431,12 @@ def main():
     )
 
     key_name = API_KEY_MAP[provider]
-    api_key = os.environ.get(key_name) or st.secrets.get(key_name)
+    api_key = os.environ.get(key_name)
+    if not api_key:
+        try:
+            api_key = st.secrets.get(key_name)
+        except Exception:
+            api_key = None
 
     if not api_key:
         st.sidebar.error(f"{key_name} not set.")
