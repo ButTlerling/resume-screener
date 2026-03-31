@@ -21,7 +21,7 @@ GEMINI_FLASH_MODEL = "gemini-2.5-flash"
 GEMINI_PRO_MODEL = "gemini-2.5-pro"
 GEMINI_31_PRO_MODEL = "gemini-3.1-pro-preview"
 MAX_RESUME_CHARS = 24_000
-MAX_TOKENS_RESPONSE = 512
+MAX_TOKENS_RESPONSE = 1024
 
 MODEL_OPTIONS = {
     "GPT-5.4": "openai_54",
@@ -55,7 +55,16 @@ Use exactly this schema:
   "key_gaps": [<string>, ...],
   "summary": "<one sentence summary of the candidate>",
   "university": "<university name, or 'Not listed' if absent>",
-  "major": "<degree and field of study, e.g. 'B.S. Computer Science', or 'Not listed' if absent>"
+  "major": "<degree and field of study, e.g. 'B.S. Computer Science', or 'Not listed' if absent>",
+  "skills": {
+    "coding": [<programming languages explicitly listed, e.g. "Python", "Java", "C++">],
+    "libraries": [<frameworks/libraries listed, e.g. "NumPy", "TensorFlow", "React">],
+    "electrical_eng": [<EE-related skills listed, e.g. "MATLAB", "PCB Design", "Circuit Analysis"; empty list if none>],
+    "other": [<other technical skills not in above categories, e.g. "SQL", "Excel", "CAD"; empty list if none>]
+  },
+  "internships": [<"Company — Role (Year)" for each internship, max 5 items, empty list if none>],
+  "projects": [<brief project title or one-line description, max 5 items, empty list if none>],
+  "extracurriculars": [<clubs, sports, volunteer work, leadership, hobbies, max 5 items, empty list if none>]
 }
 
 Scoring rubric — blended skills + character system (total 10 points):
@@ -392,6 +401,7 @@ def analyze_resume(client, provider: str, job_description: str, resume_text: str
     return analyze_resume_openai(client, job_description, resume_text, filename)
 
 
+
 def build_dataframe(results: list[dict]) -> pd.DataFrame:
     rows = []
     for rank, r in enumerate(results, start=1):
@@ -402,7 +412,7 @@ def build_dataframe(results: list[dict]) -> pd.DataFrame:
                 "Score (1-10)": r["match_score"],
                 "University": r.get("university", "Not listed"),
                 "Major": r.get("major", "Not listed"),
-                "Key Strengths": " | ".join(r.get("key_strengths", [])),
+"Key Strengths": " | ".join(r.get("key_strengths", [])),
                 "Key Gaps": " | ".join(r.get("key_gaps", [])),
                 "Summary": r.get("summary", ""),
                 "Filename": r["filename"],
@@ -413,9 +423,296 @@ def build_dataframe(results: list[dict]) -> pd.DataFrame:
 
 # ── Streamlit UI ───────────────────────────────────────────────────────────────
 
+_STOPWORDS = {
+    'the','a','an','and','or','but','in','on','at','to','for','of','with','by',
+    'from','up','about','into','is','are','was','were','be','been','have','has',
+    'had','do','does','did','will','would','could','should','may','might','must',
+    'can','this','that','these','those','we','our','you','your','it','its','as',
+    'if','not','no','so','than','then','their','they','them','what','which','who',
+    'when','where','how','all','each','both','few','more','most','other','some',
+    'such','only','same','also','well','just','very','new','work','use','using',
+    'used','including','include','experience','strong','knowledge','ability',
+    'skills','skill','role','candidate','team','position','responsibilities',
+}
+
+def _jd_keywords(jd: str) -> set[str]:
+    """Extract meaningful lowercase keywords from the job description."""
+    words = re.findall(r'[a-zA-Z][a-zA-Z0-9+#.]*', jd.lower())
+    return {w for w in words if w not in _STOPWORDS and len(w) > 2}
+
+def _skill_matches(skill: str, jd_text: str) -> bool:
+    """True only when the skill name itself (as a whole word/phrase) appears in the JD."""
+    jd_lower = jd_text.lower()
+    skill_lower = re.sub(r'[-/]', ' ', skill.lower()).strip()
+    # Phrase match: the full skill name is a substring surrounded by word boundaries
+    pattern = r'(?<![a-zA-Z0-9])' + re.escape(skill_lower) + r'(?![a-zA-Z0-9])'
+    return bool(re.search(pattern, jd_lower))
+
+def _text_matches(text: str, jd_kw: set[str]) -> bool:
+    words = re.findall(r'[a-zA-Z][a-zA-Z0-9+#.]*', text.lower())
+    hits = sum(1 for w in words if w in jd_kw and len(w) >= 4)
+    return hits >= 3
+
+
+@st.dialog("Candidate Details", width="large")
+def show_candidate_dialog(r: dict, jd_kw: set[str], jd_text: str):
+    # Force dialog to fill the screen width
+    st.markdown(
+        """
+<style>
+div[data-testid="stDialog"] > div > div[role="dialog"] {
+    width: 92vw !important;
+    max-width: 92vw !important;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+    name = r.get("candidate_name", "Unknown")
+    score = r.get("match_score", "N/A")
+    skills = r.get("skills", {})
+
+    # ── Header ──
+    score_color = "#16a34a" if score >= 8 else "#d97706" if score >= 5 else "#dc2626"
+    st.markdown(
+        f"<h2 style='margin:0 0 0.2rem 0;'>{name}"
+        f"&ensp;<span style='color:{score_color}; font-size:1.1rem; font-weight:600;'>{score}/10</span></h2>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<p style='color:#6b7280; margin:0 0 0.3rem 0;'>{r.get('summary', '')}</p>"
+        f"<p style='font-size:0.85rem; color:#9ca3af; margin:0;'>"
+        f"{r.get('university', 'Not listed')} &nbsp;·&nbsp; {r.get('major', 'Not listed')}</p>",
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
+    # ── Skills row (full width, 4 inline blocks) ──
+    coding = skills.get("coding", [])
+    libs   = skills.get("libraries", [])
+    ee     = skills.get("electrical_eng", [])
+    other  = skills.get("other", [])
+
+    def _tags(items: list[str]) -> str:
+        if not items:
+            return "<span style='color:#9ca3af; font-size:0.82rem;'>None listed</span>"
+        parts = []
+        for t in items:
+            if _skill_matches(t, jd_text):
+                bg, fg = "#dbeafe", "#1d4ed8"   # calm blue — JD match
+            else:
+                bg, fg = "#ede9fe", "#5b21b6"   # soft purple — no match
+            parts.append(
+                f"<span style='background:{bg}; color:{fg}; border-radius:4px;"
+                f" padding:2px 8px; font-size:0.8rem; margin:2px; display:inline-block;'>{t}</span>"
+            )
+        return " ".join(parts)
+
+    st.markdown(
+        f"""
+<div style='display:flex; gap:2rem; flex-wrap:wrap; margin-bottom:0.25rem;'>
+  <div style='flex:1; min-width:180px;'>
+    <div style='font-size:0.72rem; font-weight:700; letter-spacing:0.07em;
+                text-transform:uppercase; color:#6b7280; margin-bottom:4px;'>Coding</div>
+    {_tags(coding)}
+  </div>
+  <div style='flex:2; min-width:220px;'>
+    <div style='font-size:0.72rem; font-weight:700; letter-spacing:0.07em;
+                text-transform:uppercase; color:#6b7280; margin-bottom:4px;'>Libraries & Frameworks</div>
+    {_tags(libs)}
+  </div>
+  <div style='flex:1.5; min-width:180px;'>
+    <div style='font-size:0.72rem; font-weight:700; letter-spacing:0.07em;
+                text-transform:uppercase; color:#6b7280; margin-bottom:4px;'>Electrical Engineering</div>
+    {_tags(ee)}
+  </div>
+  <div style='flex:1; min-width:160px;'>
+    <div style='font-size:0.72rem; font-weight:700; letter-spacing:0.07em;
+                text-transform:uppercase; color:#6b7280; margin-bottom:4px;'>Other</div>
+    {_tags(other)}
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
+    # ── 4-column body ──
+    c1, c2, c3, c4 = st.columns(4)
+
+    def _bullet_list(col, heading: str, items: list[str]):
+        with col:
+            st.markdown(f"**{heading}**")
+            if not items:
+                st.markdown("*None listed*")
+                return
+            lines = []
+            for item in items:
+                if _text_matches(item, jd_kw):
+                    lines.append(
+                        f"<li style='color:#1d4ed8; background:#eff6ff; border-radius:4px;"
+                        f" padding:2px 6px; margin:3px 0;'>{item}</li>"
+                    )
+                else:
+                    lines.append(f"<li style='margin:3px 0;'>{item}</li>")
+            st.markdown(
+                f"<ul style='padding-left:1.2rem; margin:0;'>{''.join(lines)}</ul>",
+                unsafe_allow_html=True,
+            )
+
+    _bullet_list(c1, "Internships",     r.get("internships", []))
+    _bullet_list(c2, "Projects",        r.get("projects", []))
+    _bullet_list(c3, "Extracurriculars",r.get("extracurriculars", []))
+
+    _bullet_list(c4, "Key Strengths", r.get("key_strengths", []))
+    with c4:
+        st.markdown("**Key Gaps**")
+        gaps = r.get("key_gaps", [])
+        if not gaps:
+            st.markdown("*None listed*")
+        else:
+            lines = [
+                f"<li style='color:#dc2626; margin:3px 0;'>{g}</li>"
+                for g in gaps
+            ]
+            st.markdown(
+                f"<ul style='padding-left:1.2rem; margin:0;'>{''.join(lines)}</ul>",
+                unsafe_allow_html=True,
+            )
+
+
+def build_display_dataframe(results: list[dict]) -> pd.DataFrame:
+    rows = []
+    for rank, r in enumerate(results, start=1):
+        rows.append({
+            "Rank": rank,
+            "Name": r.get("candidate_name", "Unknown"),
+            "Score": r["match_score"],
+            "University": r.get("university", "Not listed"),
+            "Major": r.get("major", "Not listed"),
+        })
+    return pd.DataFrame(rows)
+
+
 def main():
     st.set_page_config(page_title="Resume Screener", layout="wide")
-    st.title("Resume Screener")
+
+    st.markdown(
+        """
+<style>
+footer { visibility: hidden; }
+
+.main .block-container {
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+    max-width: 1200px;
+}
+
+/* Hero banner */
+.hero {
+    background: linear-gradient(135deg, #5865F2 0%, #7C3AED 100%);
+    border-radius: 14px;
+    padding: 2rem 2.5rem;
+    margin-bottom: 2rem;
+    color: white;
+}
+.hero h1 {
+    margin: 0 0 0.3rem 0;
+    font-size: 2rem;
+    font-weight: 700;
+    color: white !important;
+}
+.hero p {
+    margin: 0;
+    font-size: 1rem;
+    opacity: 0.85;
+    color: white !important;
+}
+
+/* Section cards */
+.upload-card {
+    background: white;
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem 1rem 1.5rem;
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 1px 6px rgba(0,0,0,0.05);
+    margin-bottom: 0.5rem;
+}
+.section-label {
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: #6b7280;
+    margin-bottom: 0.6rem;
+}
+
+/* File uploader */
+[data-testid="stFileUploader"] {
+    background: #fafafa;
+    border-radius: 10px;
+    padding: 4px;
+}
+
+/* Text area */
+[data-testid="stTextArea"] textarea {
+    border-radius: 8px;
+    font-size: 0.875rem;
+    border-color: #e5e7eb;
+}
+
+/* Primary button */
+.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #5865F2 0%, #7C3AED 100%);
+    border: none;
+    border-radius: 8px;
+    font-weight: 600;
+    padding: 0.5rem 2.5rem;
+    color: white;
+    font-size: 0.95rem;
+}
+.stButton > button[kind="primary"]:hover {
+    background: linear-gradient(135deg, #4752d8 0%, #6929c4 100%);
+    border: none;
+}
+
+/* Download button */
+.stDownloadButton > button {
+    border-radius: 8px;
+    font-size: 0.85rem;
+}
+
+/* Results table */
+[data-testid="stDataFrame"] {
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid #e5e7eb;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    border-right: 1px solid #e5e7eb;
+}
+[data-testid="stSidebar"] .stSelectbox label,
+[data-testid="stSidebar"] .stNumberInput label {
+    font-size: 0.85rem;
+    color: #6b7280;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+<div class="hero">
+  <h1>Resume Screener</h1>
+  <p>Upload a stack of resumes and a job description — we'll read every one and surface your best candidates.</p>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
     # ── Sidebar: model selection + API key status ──
     st.sidebar.header("Settings")
@@ -447,8 +744,7 @@ def main():
         st.stop()
     else:
         st.sidebar.success(f"{key_name} loaded.")
-
-    st.caption(f"Using: {model_label}")
+        st.sidebar.caption(f"Model: {model_label}")
 
     # ── Inputs ──
     col1, col2 = st.columns([1, 1])
@@ -497,9 +793,22 @@ def main():
 
     if not inputs_ready and not run_button:
         if not uploaded_files:
-            st.info("Upload one or more resumes to get started.")
+            st.markdown(
+                "<div style='text-align:center; padding:3rem 0; color:#9ca3af;'>"
+                "<p style='font-size:2rem; margin-bottom:0.5rem;'>📄</p>"
+                "<p style='font-size:1rem; font-weight:500; color:#6b7280;'>Upload resumes on the left, paste a job description on the right.</p>"
+                "<p style='font-size:0.85rem;'>PDF &amp; DOCX &nbsp;·&nbsp; Batch upload &nbsp;·&nbsp; Combined PDFs supported</p>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
         elif not job_description.strip():
-            st.info("Enter or upload a job description to continue.")
+            st.markdown(
+                "<div style='text-align:center; padding:2rem 0; color:#9ca3af;'>"
+                "<p style='font-size:1.5rem; margin-bottom:0.4rem;'>✏️</p>"
+                "<p style='font-size:0.95rem; color:#6b7280;'>Almost there — paste or upload a job description on the right.</p>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
     if run_button:
         # ── Processing ──
@@ -570,16 +879,36 @@ def main():
 
         results.sort(key=lambda x: x.get("match_score", 0), reverse=True)
         st.session_state["screening_results"] = results
+        st.session_state["job_description"] = job_description
 
     # ── Results (persisted across reruns) ──
     results = st.session_state.get("screening_results")
     if results:
         top_n = results[:num_to_pick]
 
-        st.success(f"Screened {len(results)} resume(s). Showing top {len(top_n)} pick(s).")
+        st.success(f"Screened {len(results)} resume(s) — showing your top {len(top_n)}. Click any row for details.")
 
-        df_display = build_dataframe(top_n)
-        st.dataframe(df_display, width="stretch", hide_index=True)
+        df_display = build_display_dataframe(top_n)
+        event = st.dataframe(
+            df_display,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            column_config={
+                "Score": st.column_config.ProgressColumn(
+                    "Score",
+                    min_value=0,
+                    max_value=10,
+                    format="%d / 10",
+                ),
+            },
+        )
+        selected_rows = event.selection.rows
+        if selected_rows:
+            jd = st.session_state.get("job_description", "")
+            jd_kw = _jd_keywords(jd)
+            show_candidate_dialog(top_n[selected_rows[0]], jd_kw, jd)
 
         df_all = build_dataframe(results)
         csv = df_all.to_csv(index=False)
@@ -589,29 +918,6 @@ def main():
             file_name="screening_results.csv",
             mime="text/csv",
         )
-
-        # ── Detail cards ──
-        st.divider()
-        st.subheader("Detailed Breakdown")
-        for rank, r in enumerate(top_n, start=1):
-            score = r.get("match_score", "N/A")
-            name = r.get("candidate_name", "Unknown")
-            with st.expander(f"#{rank} — {name} — Score: {score}/10"):
-                st.write("**Summary:**", r.get("summary", ""))
-                st.write("**University:**", r.get("university", "Not listed"))
-                st.write("**Major:**", r.get("major", "Not listed"))
-
-                strengths = r.get("key_strengths", [])
-                if strengths:
-                    st.write("**Key Strengths:**")
-                    for s in strengths:
-                        st.write(f"- {s}")
-
-                gaps = r.get("key_gaps", [])
-                if gaps:
-                    st.write("**Key Gaps:**")
-                    for g in gaps:
-                        st.write(f"- {g}")
 
 
 if __name__ == "__main__":
