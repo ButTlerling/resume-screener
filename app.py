@@ -884,9 +884,24 @@ footer { visibility: hidden; }
     # ── Results (persisted across reruns) ──
     results = st.session_state.get("screening_results")
     if results:
-        top_n = results[:num_to_pick]
+        if len(results) <= num_to_pick:
+            top_n = results
+            tie_msg = None
+        else:
+            cutoff_score = results[num_to_pick - 1].get("match_score", 0)
+            top_n = [r for r in results if r.get("match_score", 0) >= cutoff_score]
+            if len(top_n) > num_to_pick:
+                tied_count = sum(1 for r in results if r.get("match_score", 0) == cutoff_score)
+                tie_msg = (
+                    f"Showing **{len(top_n)} candidates** instead of {num_to_pick} — "
+                    f"**{tied_count} candidates are tied at score {cutoff_score}**, so all are included."
+                )
+            else:
+                tie_msg = None
 
         st.success(f"Screened {len(results)} resume(s) — showing your top {len(top_n)}. Click any row for details.")
+        if tie_msg is not None:
+            st.info(tie_msg)
 
         df_display = build_display_dataframe(top_n)
         event = st.dataframe(
